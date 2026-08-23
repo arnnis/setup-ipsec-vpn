@@ -385,15 +385,19 @@ if [ "\$HAS_IP6" = 1 ]; then
   ip -6 route replace default dev "\$WARP_IF" table "\$WARP_TABLE" 2>/dev/null || ip -6 route add default dev "\$WARP_IF" table "\$WARP_TABLE" 2>/dev/null || true
 fi
 
-# 3) Rules: only FROM VPN subnets -> WARP (SSH stays on main)
-for net in "\$L2TP_NET" "\$XAUTH_NET"; do
-  [ -z "\$net" ] && continue
-  ip rule del from "\$net" table "\$WARP_TABLE" 2>/dev/null || true
-  ip rule add from "\$net" table "\$WARP_TABLE" priority 51820 2>/dev/null || ip rule add from "\$net" lookup "\$WARP_TABLE" 2>/dev/null || true
-done
+# 3) Rules: only FROM VPN subnets -> WARP (SSH stays on main) - priority 100/101 < main (32766) !
+for net in "\$L2TP_NET" "\$XAUTH_NET"; do ip rule del from "\$net" table "\$WARP_TABLE" 2>/dev/null || true; done
+ip rule del from "\$L2TP_NET" lookup "\$WARP_TABLE" 2>/dev/null || true
+ip rule del from "\$XAUTH_NET" lookup "\$WARP_TABLE" 2>/dev/null || true
+if [ -n "\$L2TP_NET" ]; then
+  ip rule add from "\$L2TP_NET" table "\$WARP_TABLE" priority 100 2>/dev/null || ip rule add from "\$L2TP_NET" lookup "\$WARP_TABLE" 2>/dev/null || true
+fi
+if [ -n "\$XAUTH_NET" ]; then
+  ip rule add from "\$XAUTH_NET" table "\$WARP_TABLE" priority 101 2>/dev/null || ip rule add from "\$XAUTH_NET" lookup "\$WARP_TABLE" 2>/dev/null || true
+fi
 if [ "\$HAS_IP6" = 1 ] && [ -n "\$IP6_NET" ]; then
   ip -6 rule del from "\$IP6_NET" table "\$WARP_TABLE" 2>/dev/null || true
-  ip -6 rule add from "\$IP6_NET" table "\$WARP_TABLE" priority 51820 2>/dev/null || ip -6 rule add from "\$IP6_NET" lookup "\$WARP_TABLE" 2>/dev/null || true
+  ip -6 rule add from "\$IP6_NET" table "\$WARP_TABLE" priority 102 2>/dev/null || ip -6 rule add from "\$IP6_NET" lookup "\$WARP_TABLE" priority 102 2>/dev/null || true
 fi
 
 # 4) Sysctl for warp interface (performance & no rp_filter drop)
