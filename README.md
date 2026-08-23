@@ -386,6 +386,18 @@ See [Manage VPN users](docs/manage-users.md).
 - [View or update the IPsec PSK](docs/manage-users.md#view-or-update-the-ipsec-psk)
 - [Manually manage VPN users](docs/manage-users.md#manually-manage-vpn-users)
 
+## Route VPN traffic via Cloudflare WARP (optional)
+
+To route IKEv2/L2TP/XAuth **client** internet traffic through Cloudflare WARP while keeping SSH and host traffic direct (high performance, kernel WireGuard + policy routing, no SSH lockout):
+
+```bash
+wget https://raw.githubusercontent.com/hwdsl2/setup-ipsec-vpn/master/extras/warp.sh -O warp.sh
+sudo bash warp.sh          # install/enable (idempotent)
+sudo bash warp.sh status   # check handshake, rules, routes
+```
+
+See [WARP docs](docs/warp.md) for existing-server instructions, customization and troubleshooting. Uninstall: `sudo bash warp.sh uninstall`.
+
 ## Advanced usage
 
 See [Advanced usage](docs/advanced-usage.md).
