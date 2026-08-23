@@ -235,15 +235,15 @@ ensure_warp_conf() {
   # 1) explicit env
   if [ -n "$WARP_CONF_SRC" ] && [ -f "$WARP_CONF_SRC" ]; then
     SRC="$WARP_CONF_SRC"
-  # 2) existing warp conf already valid
-  elif [ -s "$WARP_CONF" ] && grep -q "PrivateKey" "$WARP_CONF"; then
-    SRC="$WARP_CONF"
-    bigecho "Existing $WARP_CONF found - will patch it for policy routing."
-  # 3) search common locations for wgcf-profile
   else
     for cand in "./wgcf-profile.conf" "/opt/wgcf-profile.conf" "/etc/wireguard/wgcf-profile.conf" "/root/wgcf-profile.conf" "/opt/src/wgcf-profile.conf" "$PWD/wgcf-profile.conf"; do
       if [ -s "$cand" ] && grep -q "PrivateKey" "$cand"; then SRC="$cand"; bigecho "Found profile source $cand"; break; fi
     done
+  fi
+  # 2) existing warp conf already valid (fallback, may be broken from earlier bug - will auto-fix padding)
+  if [ -z "$SRC" ] && [ -s "$WARP_CONF" ] && grep -q "PrivateKey" "$WARP_CONF"; then
+    SRC="$WARP_CONF"
+    bigecho "Existing $WARP_CONF found - will patch it for policy routing."
   fi
 
   # 3b) search wgcf-account.toml -> generate profile if found
@@ -289,21 +289,24 @@ ensure_warp_conf() {
   # Now patch SRC into proper warp.conf with Table=off and helpers
   bigecho "Creating $WARP_CONF from $SRC (Table=off, MTU 1280, policy routing safe)"
   conf_bk "$WARP_CONF"
-  # extract keys
-  PK=$(grep -i "PrivateKey" "$SRC" | cut -d= -f2 | tr -d ' ' | head -n1)
-  ADDR4=$(grep -i "Address" "$SRC" | tr ',' '\n' | grep -E '172\.16\.' | head -n1 | cut -d= -f2 | tr -d ' ' 2>/dev/null || grep "Address" "$SRC" | head -n1 | cut -d= -f2 | tr -d ' ' | cut -d',' -f1)
+  # extract keys - use f2- to keep base64 padding '='
+  PK=$(grep -i "PrivateKey" "$SRC" | cut -d= -f2- | tr -d ' \r' | head -n1)
+  # auto-fix missing padding (cut -d= bug in older script)
+  if [ -n "$PK" ] && [ ${#PK} -eq 43 ]; then PK="${PK}="; fi
+  ADDR4=$(grep -i "Address" "$SRC" | tr ',' '\n' | grep -E '172\.16\.' | head -n1 | cut -d= -f2- | tr -d ' \r' 2>/dev/null || grep "Address" "$SRC" | head -n1 | cut -d= -f2- | tr -d ' \r' | cut -d',' -f1)
   # more robust: get all Address lines
   ADDR_LINE=$(grep -i "^Address" "$SRC" | head -n1)
   # if Address contains both v4 and v6, split
-  ADDRS=$(printf '%s' "$ADDR_LINE" | cut -d= -f2 | tr -d ' ')
+  ADDRS=$(printf '%s' "$ADDR_LINE" | cut -d= -f2- | tr -d ' \r')
   ADDR_V4=$(printf '%s' "$ADDRS" | tr ',' '\n' | grep -E '^[0-9].*\/32' | head -n1)
   ADDR_V6=$(printf '%s' "$ADDRS" | tr ',' '\n' | grep -E ':' | head -n1)
   [ -z "$ADDR_V4" ] && ADDR_V4=$(printf '%s' "$ADDRS" | tr ',' '\n' | head -n1)
 
-  PUBKEY=$(grep -i "PublicKey" "$SRC" | cut -d= -f2 | tr -d ' ' | head -n1)
-  ENDPOINT_SRC=$(grep -i "Endpoint" "$SRC" | cut -d= -f2 | tr -d ' ' | head -n1)
+  PUBKEY=$(grep -i "PublicKey" "$SRC" | cut -d= -f2- | tr -d ' \r' | head -n1)
+  if [ -n "$PUBKEY" ] && [ ${#PUBKEY} -eq 43 ]; then PUBKEY="${PUBKEY}="; fi
+  ENDPOINT_SRC=$(grep -i "Endpoint" "$SRC" | cut -d= -f2- | tr -d ' \r' | head -n1)
   [ -n "$ENDPOINT_SRC" ] && WARP_ENDPOINT="$ENDPOINT_SRC"
-  ALLOWED=$(grep -i "AllowedIPs" "$SRC" | head -n1 | cut -d= -f2 | tr -d ' ' )
+  ALLOWED=$(grep -i "AllowedIPs" "$SRC" | head -n1 | cut -d= -f2- | tr -d ' \r' )
   [ -z "$ALLOWED" ] && ALLOWED="0.0.0.0/0,::/0"
 
   [ -n "$PK" ] || exiterr "PrivateKey not found in $SRC"
