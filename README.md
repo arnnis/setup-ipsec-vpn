@@ -398,6 +398,23 @@ sudo bash warp.sh status   # check handshake, rules, routes
 
 See [WARP docs](docs/warp.md) for existing-server instructions, customization and troubleshooting. Uninstall: `sudo bash warp.sh uninstall`.
 
+## Route VPN traffic via ProtonVPN (free WireGuard) (optional)
+
+To route IKEv2/L2TP/XAuth **client** internet traffic through a **ProtonVPN Free** WireGuard server while keeping SSH and host traffic direct (same design as the WARP addon above - kernel WireGuard + policy routing, no SSH lockout, no reboot needed):
+
+```bash
+wget https://raw.githubusercontent.com/arnnis/setup-ipsec-vpn/master/extras/proton.sh -O proton.sh
+# one-time: download your ProtonVPN WireGuard .conf (Free plan works) from
+# https://account.protonvpn.com/downloads -> "WireGuard configuration",
+# upload it, then:
+sudo PROTON_CONF_SRC=/root/protonvpn-free.conf bash proton.sh   # install/enable
+sudo bash proton.sh status                                       # check handshake, rules, routes
+```
+
+See [ProtonVPN docs](docs/proton.md) for the one-time config download, existing-server instructions, customization and troubleshooting. Uninstall: `sudo bash proton.sh uninstall`.
+
+> WARP and ProtonVPN are alternatives: they both route the same VPN client subnets, so enable only one at a time (`sudo bash warp.sh uninstall` before `proton.sh`, and vice versa).
+
 ## Advanced usage
 
 See [Advanced usage](docs/advanced-usage.md).
