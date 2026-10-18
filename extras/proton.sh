@@ -45,6 +45,9 @@ PROTON_UP_HELPER="${PROTON_HELPER_DIR}/proton-up.sh"
 PROTON_DOWN_HELPER="${PROTON_HELPER_DIR}/proton-down.sh"
 PROTON_LEGACY_UP_HELPER="/usr/local/sbin/proton-up.sh"
 PROTON_LEGACY_DOWN_HELPER="/usr/local/sbin/proton-down.sh"
+# 1 = put PostUp/PreDown in proton.conf (no systemd); 0 = systemd runs the helpers.
+# Decided in do_install once we know whether systemctl exists.
+PROTON_HOOKS_IN_CONF=1
 PROTON_ENDPOINT_DEFAULT=""   # no hardcoded Proton endpoint: taken from the downloaded .conf
 PROTON_ENDPOINT="${PROTON_ENDPOINT:-$PROTON_ENDPOINT_DEFAULT}"
 
@@ -403,8 +406,14 @@ ensure_proton_conf() {
     IFS=$old_ifs
     echo "MTU = $MTU_VAL"
     echo "Table = off"
-    echo "PostUp = $PROTON_UP_HELPER"
-    echo "PreDown = $PROTON_DOWN_HELPER"
+    # wg-quick execs PostUp/PreDown itself (old builds via an unquoted
+    # "POST_UP+=( ${value//;/ ; } )", which word-splits and only tolerates a single
+    # command). When systemd is available we let the unit run the helpers instead,
+    # so the tunnel never depends on wg-quick being able to exec them.
+    if [ "$PROTON_HOOKS_IN_CONF" = 1 ]; then
+      echo "PostUp = $PROTON_UP_HELPER"
+      echo "PreDown = $PROTON_DOWN_HELPER"
+    fi
     echo "# DNS intentionally not set here to avoid overwriting host resolv.conf."
     echo "# (ProtonVPN's internal DNS 10.2.0.1 is only reachable inside the tunnel;"
     echo "#  VPN clients do their own DNS, the VPS host keeps its own resolver.)"
@@ -416,7 +425,11 @@ ensure_proton_conf() {
     echo "PersistentKeepalive = $KEEPALIVE_VAL"
   } > "$PROTON_CONF"
   chmod 600 "$PROTON_CONF"
-  bigecho "Wrote $PROTON_CONF (Table=off, PostUp helper, MTU $MTU_VAL, PersistentKeepalive $KEEPALIVE_VAL, v6=$PROTON_V6)"
+  if [ "$PROTON_HOOKS_IN_CONF" = 1 ]; then
+    bigecho "Wrote $PROTON_CONF (Table=off, PostUp hook, MTU $MTU_VAL, PersistentKeepalive $KEEPALIVE_VAL, v6=$PROTON_V6)"
+  else
+    bigecho "Wrote $PROTON_CONF (Table=off, MTU $MTU_VAL, PersistentKeepalive $KEEPALIVE_VAL, v6=$PROTON_V6, hooks via systemd)"
+  fi
   grep -v "PrivateKey" "$PROTON_CONF" || true
 }
 
@@ -594,8 +607,15 @@ EOS
 enable_systemd() {
   if command -v systemctl >/dev/null 2>&1; then
     bigecho "Enabling wg-quick@${PROTON_IF} via systemd..."
+    helper_check "$PROTON_UP_HELPER"
+    helper_check "$PROTON_DOWN_HELPER"
     systemctl enable "wg-quick@${PROTON_IF}" 2>/dev/null || true
-    # drop-in: start after network is ready (avoid SSH race) and restart on failure
+    # Drop-in: start after network is ready (avoid SSH race), and - most importantly -
+    # run the routing helpers from the unit instead of from wg-quick's PostUp hook.
+    # Old wg-quick builds word-split the hook value and some hosts refuse to let
+    # wg-quick's own "(eval "$hook")" exec the helper (Permission denied, rc=126),
+    # which aborted "wg-quick up" even though the tunnel itself was fine. The "-"
+    # prefix stops a helper failure from marking the unit failed (and looping).
     mkdir -p "/etc/systemd/system/wg-quick@${PROTON_IF}.service.d"
     cat > "/etc/systemd/system/wg-quick@${PROTON_IF}.service.d/override.conf" <<EOF
 [Unit]
@@ -604,6 +624,8 @@ Wants=network-online.target
 [Service]
 Restart=on-failure
 RestartSec=5
+ExecStartPost=-$PROTON_UP_HELPER
+ExecStopPost=-$PROTON_DOWN_HELPER
 EOF
     systemctl daemon-reload
     bigecho "Starting ProtonVPN interface $PROTON_IF ..."
@@ -611,20 +633,15 @@ EOF
     if [ -n "$ENDPOINT_IP" ] && [ -n "$GW" ]; then
       ip route replace "$ENDPOINT_IP/32" via "$GW" dev "$NET_IFACE" 2>/dev/null || ip route add "$ENDPOINT_IP/32" via "$GW" dev "$NET_IFACE" 2>/dev/null || true
     fi
-    wg-quick down "$PROTON_IF" 2>/dev/null || true
-    helper_check "$PROTON_UP_HELPER"
-    helper_check "$PROTON_DOWN_HELPER"
-    wg-quick up "$PROTON_IF" 2>&1 | tee /tmp/proton-wg-quick.log
-    wg_quick_rc=${PIPESTATUS[0]}
-    if [ "$wg_quick_rc" -ne 0 ]; then
-      cat /tmp/proton-wg-quick.log >&2
-      ls -l "$PROTON_UP_HELPER" "$PROTON_DOWN_HELPER" >&2 || true
-      exiterr "wg-quick up $PROTON_IF failed (rc=$wg_quick_rc). Check $PROTON_CONF and 'wg show' / 'journalctl -u wg-quick@${PROTON_IF}'. If rc=126, the PostUp helper is not executable - run: chmod 0755 $PROTON_UP_HELPER"
+    start_rc=0
+    systemctl restart "wg-quick@${PROTON_IF}" 2>&1 | tee /tmp/proton-systemd.log || start_rc=${PIPESTATUS[0]}
+    if [ "$start_rc" -ne 0 ]; then
+      cat /tmp/proton-systemd.log >&2
+      exiterr "systemctl restart wg-quick@${PROTON_IF} failed. See 'journalctl -u wg-quick@${PROTON_IF} -n 50 --no-pager'"
     fi
+    # Safety net: if ExecStartPost could not run the helper, apply the routing here.
+    verify_routing
     bigecho "ProtonVPN $PROTON_IF up."
-    # verify PostUp ran
-    sleep 1
-    "$PROTON_UP_HELPER" || true
   elif [ "$os_type" = "alpine" ]; then
     bigecho "Enabling ProtonVPN via OpenRC..."
     rc-update add "wg-quick.${PROTON_IF}" default 2>/dev/null || {
@@ -635,6 +652,22 @@ EOF
   else
     bigecho "No systemd/OpenRC found - bringing up ProtonVPN manually..."
     wg-quick up "$PROTON_IF" || exiterr "wg-quick up failed"
+  fi
+}
+
+# Post-start sanity check: the policy rules are what actually make clients go
+# through ProtonVPN, so confirm them instead of trusting the hook to have run.
+verify_routing() {
+  sleep 1
+  if ip rule show 2>/dev/null | grep -q "table $PROTON_TABLE"; then
+    return 0
+  fi
+  bigecho "Policy routing rules missing - running $PROTON_UP_HELPER directly"
+  "$PROTON_UP_HELPER" || true
+  if ip rule show 2>/dev/null | grep -q "table $PROTON_TABLE"; then
+    echo "Routing applied (note: wg-quick could not run the helper itself)."
+  else
+    echo "Warning: could not apply policy routing. Check: ip rule show / journalctl -u wg-quick@${PROTON_IF}" >&2
   fi
 }
 
@@ -746,6 +779,7 @@ do_install() {
   detect_iface
   detect_subnets
   select_helper_dir
+  if command -v systemctl >/dev/null 2>&1; then PROTON_HOOKS_IN_CONF=0; else PROTON_HOOKS_IN_CONF=1; fi
   install_wireguard_pkgs
   ensure_proton_conf
   resolve_endpoint_ip
@@ -797,10 +831,15 @@ case "${1:-install}" in
   restart|reload)
     bigecho "Restarting ProtonVPN..."
     if ip link show dev "$PROTON_IF" >/dev/null 2>&1; then
-      wg-quick down "$PROTON_IF" 2>/dev/null || true
-      sleep 1
-      wg-quick up "$PROTON_IF" 2>/dev/null || true
-      "$PROTON_UP_HELPER" 2>/dev/null || true
+      if command -v systemctl >/dev/null 2>&1; then
+        systemctl restart "wg-quick@${PROTON_IF}" 2>&1 | tail -n 20 || true
+        verify_routing
+      else
+        wg-quick down "$PROTON_IF" 2>/dev/null || true
+        sleep 1
+        wg-quick up "$PROTON_IF" 2>/dev/null || true
+        "$PROTON_UP_HELPER" 2>/dev/null || true
+      fi
     else
       do_install
     fi

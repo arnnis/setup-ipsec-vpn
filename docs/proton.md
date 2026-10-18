@@ -88,7 +88,14 @@ sudo bash proton.sh uninstall  # remove ProtonVPN routing & disable wg-quick@pro
 # to re-enable: sudo bash proton.sh
 ```
 
-Re-running `sudo bash proton.sh` is safe — it rebuilds `/etc/wireguard/proton.conf` (`Table = off`, `PostUp` helper, MTU, keepalive), recreates the helpers and re-adds the rules.
+Re-running `sudo bash proton.sh` is safe — it rebuilds `/etc/wireguard/proton.conf` (`Table = off`, MTU, keepalive), recreates the helpers and re-applies the rules.
+
+On systemd hosts the tunnel config carries **no `PostUp`/`PreDown`**. The helpers are run by the
+unit instead (`ExecStartPost=`/`ExecStopPost=` in the `wg-quick@proton` drop-in), because `wg-quick`
+runs `PostUp` hooks itself and older `wg-quick` builds word-split the hook value — on some hosts that
+`(eval "$hook")` cannot execute the helper at all and `wg-quick up` aborts with
+`Permission denied` (rc=126) even though the tunnel itself came up fine. Without systemd (OpenRC /
+manual) the helpers are written into the config as `PostUp`/`PreDown` as a fallback.
 
 ## Switching between WARP and ProtonVPN
 
@@ -108,9 +115,9 @@ Their configs and systemd units (`wg-quick@warp` / `wg-quick@proton`) can coexis
 
 ## Boot persistence
 
-* `systemd`: `wg-quick@proton.service` enabled with drop-in `After=network-online.target`, helpers as `PostUp`/`PreDown`.
-* `OpenRC` (Alpine): `rc-update add wg-quick.proton`.
-* Helpers `/usr/local/sbin/proton-up.sh` / `proton-down.sh` are called by `proton.conf` and also on `restart`.
+* `systemd`: `wg-quick@proton.service` enabled with a drop-in (`After=network-online.target`, `Restart=on-failure`) that runs the helpers via `ExecStartPost=`/`ExecStopPost=`.
+* `OpenRC` (Alpine): `rc-update add wg-quick.proton`, helpers as `PostUp`/`PreDown` in the config.
+* Helpers `/usr/local/sbin/proton-up.sh` / `proton-down.sh` are mode `0755`, are re-created on every run, and are also applied directly by `restart`.
 
 ## Troubleshooting
 
@@ -118,10 +125,16 @@ Their configs and systemd units (`wg-quick@warp` / `wg-quick@proton`) can coexis
 systemctl status wg-quick@proton
 journalctl -u wg-quick@proton -n 50
 wg show proton
-cat /etc/wireguard/proton.conf   # must contain Table = off and PostUp = /usr/local/sbin/proton-up.sh
+cat /etc/wireguard/proton.conf   # must contain Table = off; no PostUp on systemd hosts
+cat /etc/systemd/system/wg-quick@proton.service.d/override.conf
+ls -l /usr/local/sbin/proton-up.sh   # must be rwxr-xr-x
 ip rule show; ip route show table 51821; iptables -t nat -S | grep proton
 bash -x /usr/local/sbin/proton-up.sh   # verbose re-apply (SSH safe)
 ```
+
+*`Permission denied` / rc=126 from `wg-quick up`* → wg-quick could not execute the `PostUp` helper. The
+script no longer relies on that: on systemd hosts the helpers run from the unit, and if the unit could
+not run them either, `proton.sh` applies the routing itself and says so.
 
 *No handshake* → endpoint blocked (UDP 51820 must be reachable *outbound* from the server), or time skewed (`timedatectl`). Try `wg-quick down proton; wg-quick up proton`.
 *Client still shows server IP* → policy rules not hit: `ip rule show` must have `from 192.168.43.0/24 lookup 51821`. Re-run `proton.sh`.
