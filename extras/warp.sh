@@ -459,7 +459,10 @@ fi
 
 echo "warp-up: routing via \$WARP_IF (table \$WARP_TABLE) for \$L2TP_NET, \$XAUTH_NET (SSH bypassed via \$NET_IFACE_DETECTED)"
 EOS
-  chmod +x "$WARP_UP_HELPER"
+  # Explicit numeric mode so the result never depends on the chmod implementation's
+  # umask handling (a bare "chmod +x" with "who" omitted can leave the helper
+  # non-executable, and PostUp then fails with "Permission denied" / rc=126).
+  chmod 0755 "$WARP_UP_HELPER"
 
   cat > "$WARP_DOWN_HELPER" <<EOS
 #!/bin/bash
@@ -502,7 +505,7 @@ if [ "\$HAS_IP6" = 1 ] && command -v ip6tables >/dev/null 2>&1; then
 fi
 echo "warp-down: cleaned table \$WARP_TABLE and iptables for \$WARP_IF"
 EOS
-  chmod +x "$WARP_DOWN_HELPER"
+  chmod 0755 "$WARP_DOWN_HELPER"
   bigecho "Helpers created."
 }
 
