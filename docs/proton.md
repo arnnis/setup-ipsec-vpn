@@ -12,6 +12,7 @@ This addon routes **IKEv2 / L2TP / XAuth** client internet traffic through a **P
   * `ip -6 rule from fddd:500:500:500::/64 lookup 51821` (only when the Proton profile has an IPv6 address and the base VPN has IPv6 enabled)
   * `ip route add default dev proton table 51821`
 * NAT: `iptables -t nat -I POSTROUTING 1 -s <vpn_subnet> -o proton -j MASQUERADE`
+* Transparent DNS: ProtonVPN blocks outbound traffic to external DNS servers (like `8.8.8.8` pushed to clients by IPsec). Client DNS queries on port 53 are transparently redirected via `PREROUTING` DNAT to Proton's internal resolver (`10.2.0.1`), ensuring domain resolution works seamlessly.
 * Performance: kernel WireGuard, MTU 1420 (ProtonVPN standard; a profile-defined MTU is kept), MSS clamp (`--clamp-mss-to-pmtu`), BBR/fq preserved, `rp_filter=0` on `proton`, `PersistentKeepalive = 25`.
 
 Original VPN MASQUERADE via `$NET_IFACE` is kept as fallback — if ProtonVPN is down, clients transparently fall back to direct.
@@ -136,6 +137,8 @@ bash -x /usr/local/sbin/proton-up.sh   # verbose re-apply (SSH safe)
 script no longer relies on that: on systemd hosts the helpers run from the unit, and if the unit could
 not run them either, `proton.sh` applies the routing itself and says so.
 
+*Ping fails but websites work* → ProtonVPN server infrastructure filters/drops external ICMP (`ping 8.8.8.8` or `1.1.1.1`). This is expected behavior on ProtonVPN; always test connectivity using HTTP/HTTPS (`curl https://ifconfig.co` or web browser), not ping.
+*Websites don't load (DNS timeout)* → check that the PREROUTING DNAT rules are active: `iptables -t nat -S | grep 53`. Client DNS queries must be redirected to `10.2.0.1` because Proton blocks direct port 53 access to `8.8.8.8`.
 *No handshake* → endpoint blocked (UDP 51820 must be reachable *outbound* from the server), or time skewed (`timedatectl`). Try `wg-quick down proton; wg-quick up proton`.
 *Client still shows server IP* → policy rules not hit: `ip rule show` must have `from 192.168.43.0/24 lookup 51821`. Re-run `proton.sh`.
 *Proton rejects the connection* → free account already connected elsewhere (1-device limit), or the profile PrivateKey no longer matches the account — download a fresh `.conf`.
