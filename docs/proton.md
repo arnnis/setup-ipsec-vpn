@@ -114,11 +114,12 @@ sudo bash warp.sh
 
 Their configs and systemd units (`wg-quick@warp` / `wg-quick@proton`) can coexist — they simply must not be enabled together.
 
-## Boot persistence
+## Boot persistence & Watchdog
 
 * `systemd`: `wg-quick@proton.service` enabled with a drop-in (`After=network-online.target`, `Restart=on-failure`) that runs the helpers via `ExecStartPost=`/`ExecStopPost=`.
-* `OpenRC` (Alpine): `rc-update add wg-quick.proton`, helpers as `PostUp`/`PreDown` in the config.
-* Helpers `/usr/local/sbin/proton-up.sh` / `proton-down.sh` are mode `0755`, are re-created on every run, and are also applied directly by `restart`.
+* `Watchdog`: `wg-proton-watchdog.timer` runs `/usr/local/sbin/proton-watchdog.sh` every minute. If the WireGuard handshake becomes stale (> 150s old due to server load/rekey/disconnects), it automatically restarts the WireGuard tunnel. If the restart fails, it temporarily suspends policy routing so client VPN traffic falls back to direct VPS egress instead of being blackholed. Once Proton responds again, policy routing is automatically restored.
+* `OpenRC` (Alpine): `rc-update add wg-quick.proton`, helpers as `PostUp`/`PreDown` in the config, watchdog installed in root crontab.
+* Helpers `/usr/local/sbin/proton-up.sh` / `proton-down.sh` / `proton-watchdog.sh` are mode `0755`, re-created on every run, and applied directly on install/restart.
 
 ## Troubleshooting
 
