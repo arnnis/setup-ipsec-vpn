@@ -48,10 +48,34 @@ PROTON_LEGACY_DOWN_HELPER="/usr/local/sbin/proton-down.sh"
 # 1 = put PostUp/PreDown in proton.conf (no systemd); 0 = systemd runs the helpers.
 # Decided in do_install once we know whether systemctl exists.
 PROTON_HOOKS_IN_CONF=1
-PROTON_DNS_DEFAULT="10.2.0.1"
+PROTON_DNS_DEFAULT=""
 PROTON_DNS="${PROTON_DNS:-$PROTON_DNS_DEFAULT}"
 PROTON_ENDPOINT_DEFAULT=""   # no hardcoded Proton endpoint: taken from the downloaded .conf
 PROTON_ENDPOINT="${PROTON_ENDPOINT:-$PROTON_ENDPOINT_DEFAULT}"
+
+derive_proton_dns() {
+  local src_conf="$1"
+  local dns_cand=""
+  [ -s "$src_conf" ] || return 1
+  # 1) Try explicit DNS line in config (un-commented or commented)
+  dns_cand=$(grep -i "DNS" "$src_conf" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d ' \r#' | awk '{print $1}')
+  if check_ip "$dns_cand" 2>/dev/null; then
+    printf '%s' "$dns_cand"
+    return 0
+  fi
+  # 2) Derive from Address IPv4 in config (e.g. 10.3.0.2 -> 10.3.0.1)
+  local addr_ip=""
+  addr_ip=$(grep -i "^[[:space:]]*Address[[:space:]]*=" "$src_conf" 2>/dev/null | tr -d ' \r' | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n1)
+  if check_ip "$addr_ip" 2>/dev/null; then
+    local derived_dns
+    derived_dns=$(printf '%s' "$addr_ip" | sed -E 's/\.[0-9]+$/\.1/')
+    if check_ip "$derived_dns" 2>/dev/null; then
+      printf '%s' "$derived_dns"
+      return 0
+    fi
+  fi
+  return 1
+}
 
 SYS_DT=$(date +%F-%T | tr ':' '_')
 
@@ -162,6 +186,17 @@ detect_subnets() {
       fi
       if printf '%s' "$cand2" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$'; then
         XAUTH_NET="$cand2"
+      fi
+    fi
+  fi
+  # also check /etc/ipsec.d/ikev2.conf for rightaddresspool
+  if [ -s /etc/ipsec.d/ikev2.conf ]; then
+    rap=$(grep -i "rightaddresspool=" /etc/ipsec.d/ikev2.conf 2>/dev/null | head -n1 | cut -d= -f2- | tr -d ' \r')
+    if [ -n "$rap" ]; then
+      first_ip=$(printf '%s' "$rap" | cut -d'-' -f1 | tr -d ' ')
+      if check_ip "$first_ip" 2>/dev/null; then
+        subnet=$(printf '%s' "$first_ip" | cut -d'.' -f1-3)".0/24"
+        XAUTH_NET="$subnet"
       fi
     fi
   fi
@@ -375,12 +410,13 @@ ensure_proton_conf() {
   esac
 
   # Internal DNS from profile (default 10.2.0.1) - used for client transparent DNAT
-  DNS_SRC=$(grep -i "^DNS" "$SRC" | head -n1 | cut -d= -f2- | tr -d ' \r' | cut -d',' -f1)
-  if check_ip "$DNS_SRC" 2>/dev/null; then
-    PROTON_DNS="$DNS_SRC"
-  elif [ -z "$PROTON_DNS" ]; then
+  if [ -z "$PROTON_DNS" ] || ! check_ip "$PROTON_DNS" 2>/dev/null; then
+    PROTON_DNS=$(derive_proton_dns "$SRC" || true)
+  fi
+  if ! check_ip "$PROTON_DNS" 2>/dev/null; then
     PROTON_DNS="10.2.0.1"
   fi
+  bigecho "ProtonVPN internal DNS for client transparent DNAT: $PROTON_DNS"
 
   # --- [Peer] fields ---
   PUBKEY=$(cfget "^PublicKey" "$SRC")
@@ -514,6 +550,10 @@ fi
 sysctl -w "net.ipv4.conf.$PROTON_IF.rp_filter=0" >/dev/null 2>&1 || true
 sysctl -w "net.ipv4.conf.$PROTON_IF.send_redirects=0" >/dev/null 2>&1 || true
 sysctl -w "net.ipv4.conf.all.rp_filter=0" >/dev/null 2>&1 || true
+sysctl -w "net.ipv4.conf.default.rp_filter=0" >/dev/null 2>&1 || true
+if [ -n "$NET_IFACE_DETECTED" ]; then
+  sysctl -w "net.ipv4.conf.$NET_IFACE_DETECTED.rp_filter=0" >/dev/null 2>&1 || true
+fi
 
 # 5) iptables NAT via proton (MASQUERADE) & transparent DNS redirect - idempotent
 if command -v iptables >/dev/null 2>&1; then
@@ -525,12 +565,15 @@ if command -v iptables >/dev/null 2>&1; then
     # Transparent DNS: ProtonVPN blocks external port 53 (e.g. 8.8.8.8 pushed to clients).
     # Intercept client port 53 queries and redirect to Proton internal DNS ($PROTON_DNS) inside tunnel.
     if [ -n "$PROTON_DNS" ]; then
-      if ! iptables -t nat -C PREROUTING -s "$net" -p udp --dport 53 -j DNAT --to-destination "$PROTON_DNS:53" 2>/dev/null; then
-        iptables -t nat -I PREROUTING 1 -s "$net" -p udp --dport 53 -j DNAT --to-destination "$PROTON_DNS:53" 2>/dev/null || true
+      # Clean existing DNS DNAT rules for this subnet (including legacy/stale destinations)
+      while iptables -t nat -D PREROUTING -s "$net" -p udp --dport 53 -j DNAT --to-destination "10.2.0.1:53" 2>/dev/null; do :; done
+      while iptables -t nat -D PREROUTING -s "$net" -p tcp --dport 53 -j DNAT --to-destination "10.2.0.1:53" 2>/dev/null; do :; done
+      if [ "$PROTON_DNS" != "10.2.0.1" ]; then
+        while iptables -t nat -D PREROUTING -s "$net" -p udp --dport 53 -j DNAT --to-destination "$PROTON_DNS:53" 2>/dev/null; do :; done
+        while iptables -t nat -D PREROUTING -s "$net" -p tcp --dport 53 -j DNAT --to-destination "$PROTON_DNS:53" 2>/dev/null; do :; done
       fi
-      if ! iptables -t nat -C PREROUTING -s "$net" -p tcp --dport 53 -j DNAT --to-destination "$PROTON_DNS:53" 2>/dev/null; then
-        iptables -t nat -I PREROUTING 2 -s "$net" -p tcp --dport 53 -j DNAT --to-destination "$PROTON_DNS:53" 2>/dev/null || true
-      fi
+      iptables -t nat -I PREROUTING 1 -s "$net" -p udp --dport 53 -j DNAT --to-destination "$PROTON_DNS:53" 2>/dev/null || true
+      iptables -t nat -I PREROUTING 2 -s "$net" -p tcp --dport 53 -j DNAT --to-destination "$PROTON_DNS:53" 2>/dev/null || true
     fi
   done
   # MSS clamp (both directions) - avoids PMTU blackhole
@@ -622,6 +665,8 @@ if command -v iptables >/dev/null 2>&1; then
       while iptables -t nat -D PREROUTING -s "$net" -p udp --dport 53 -j DNAT --to-destination "$PROTON_DNS:53" 2>/dev/null; do :; done
       while iptables -t nat -D PREROUTING -s "$net" -p tcp --dport 53 -j DNAT --to-destination "$PROTON_DNS:53" 2>/dev/null; do :; done
     fi
+    while iptables -t nat -D PREROUTING -s "$net" -p udp --dport 53 -j DNAT --to-destination "10.2.0.1:53" 2>/dev/null; do :; done
+    while iptables -t nat -D PREROUTING -s "$net" -p tcp --dport 53 -j DNAT --to-destination "10.2.0.1:53" 2>/dev/null; do :; done
     while iptables -D FORWARD -s "$net" -o "$PROTON_IF" -j ACCEPT 2>/dev/null; do :; done
     while iptables -D FORWARD -i "$PROTON_IF" -d "$net" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; do :; done
   done
@@ -854,10 +899,11 @@ check_os
 detect_iface >/dev/null 2>&1 || NET_IFACE="eth0"
 detect_subnets >/dev/null 2>&1 || true
 if [ -s "$PROTON_CONF" ]; then
-  PROTON_ENDPOINT=$(grep -i "^Endpoint" "$PROTON_CONF" | cut -d= -f2- | tr -d ' \r' | head -n1)
+  PROTON_ENDPOINT=$(grep -i "^Endpoint" "$PROTON_CONF" | grep -v '^[[:space:]]*#' | cut -d= -f2- | tr -d ' \r' | head -n1)
   resolve_endpoint_ip >/dev/null 2>&1 || true
-  conf_dns=$(grep -i "DNS" "$PROTON_CONF" | head -n1 | cut -d= -f2- | awk '{print $1}' | tr -d ' \r')
-  if check_ip "$conf_dns" 2>/dev/null; then PROTON_DNS="$conf_dns"; fi
+  if [ -z "$PROTON_DNS" ] || ! check_ip "$PROTON_DNS" 2>/dev/null; then
+    PROTON_DNS=$(derive_proton_dns "$PROTON_CONF" || true)
+  fi
 fi
 
 case "${1:-install}" in
